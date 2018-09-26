@@ -1,0 +1,1 @@
+Downloads a list of servers from RHEL Satellite server, then SSHs to each system executing a command.
