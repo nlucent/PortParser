@@ -10,42 +10,10 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 )
-
-func main() {
-	const hammerCmd = "hammer host list"
-	const portCmd = "netstat --tcp --udp --listening --program --numeric-ports"
-
-	var help bool
-	satServer := flag.String("sat", "", "Satellite Server to gather hammer host data from")
-	serverCmd := flag.String("command", portCmd, "Command to be run on remote servers")
-	sshPort := flag.String("port", "22", "SSH Port")
-	userName := flag.String("username", "", "Username to use for SSH connections")
-	passWord := flag.String("password", "", "Password for SSH connections")
-	outFile := flag.String("outfile", "output.csv", "Output file for CSV data")
-	flag.BoolVar(&help, "help", false, "Help Text")
-	flag.Parse()
-	if help == true {
-		printHelp()
-		return
-	}
-
-	servers := make(map[string]string)
-
-	fmt.Println("Connecting to " + *satServer)
-	hammer_hosts := sshCommand(*userName, *passWord, *satServer, *sshPort, hammerCmd)
-	parseHammer(hammer_hosts, servers)
-
-	for k, v := range servers {
-		if !strings.Contains(k, "template") {
-			fmt.Println("Connecting to ", k)
-			server_ports := sshCommand(*userName, *passWord, v, *sshPort, *serverCmd)
-			parseNetstat(k, server_ports, *outFile)
-		}
-	}
-
-}
 
 func printHelp() {
 	fmt.Println("-sat", "Satellite Server to gather hammer host data from")
@@ -54,7 +22,85 @@ func printHelp() {
 	fmt.Println("-username", "Username to use for SSH connections")
 	fmt.Println("-password", "Password for SSH connections")
 	fmt.Println("-outfile", "Output file for CSV data")
+	fmt.Println("-silent", "Prevent all extraneous output (for piping/automation)")
+	fmt.Println("-quiet", "Pipe informational messages to Stderr")
+	fmt.Println("-timeit", "Time each process")
 	fmt.Println("-help", "Help Text")
+}
+
+func main() {
+	const hammerCmd = "hammer host list"
+	const portCmd = "netstat --tcp --udp --listening --program --numeric-ports"
+
+	var output string
+
+	satServer := flag.String("sat", "", "Satellite Server to gather hammer host data from")
+	serverCmd := flag.String("command", portCmd, "Command to be run on remote servers")
+	sshPort := flag.String("port", "22", "SSH Port")
+	userName := flag.String("username", "", "Username to use for SSH connections")
+	passWord := flag.String("password", "", "Password for SSH connections")
+	outFile := flag.String("outfile", "output.csv", "Output file for CSV data")
+	silentFlag := flag.Bool("silent", false, "Prevent all extraneous output (for piping/automation)")
+	quietFlag := flag.Bool("quiet", false, "Pipe informational messages to Stderr")
+	timeIt := flag.Bool("timeit", false, "Time each process")
+	helpFlag := flag.Bool("help", false, "Help Text")
+	flag.Parse()
+
+	if *helpFlag {
+		printHelp()
+		return
+	}
+
+	if *quietFlag {
+		output = "quiet"
+	} else if *silentFlag {
+		output = "silent"
+	} else {
+		output = "standard"
+	}
+
+	servers := make(map[string]string)
+	ch := make(chan []string)
+
+	logOutput("\nConnecting to "+*satServer+"...", output)
+	go sshCommand(*userName, *passWord, *satServer, *sshPort, hammerCmd, ch)
+	hammer_hosts := <-ch
+	parseHammer(hammer_hosts, servers)
+	logOutput(" Found "+strconv.Itoa(len(servers))+" servers.\n\n", output)
+	for k, v := range servers {
+		if !strings.Contains(k, "template") {
+			logOutput("Connecting to "+k, output)
+			start := time.Now()
+			go sshCommand(*userName, *passWord, v, *sshPort, *serverCmd, ch)
+			server_ports := <-ch
+			if *serverCmd == portCmd {
+				logOutput(" ("+strconv.Itoa(len(server_ports))+")", output)
+				parseNetstat(k, v, server_ports, *outFile)
+			} else {
+				logOutput(" ("+strconv.Itoa(len(server_ports))+" results)", output)
+				if !*timeIt {
+					logOutput("\n", output)
+				} else {
+					logOutput(", "+time.Since(start).String()+"\n", output)
+				}
+				fmt.Println(server_ports)
+			}
+		}
+
+	}
+}
+
+func logOutput(msg string, outputType string) {
+	if outputType == "silent" {
+		// dont print informational messages
+		return
+	} else if outputType == "quiet" {
+		// print to stderr
+		fmt.Fprint(os.Stderr, msg)
+	} else {
+		// print to stdout
+		fmt.Print(msg)
+	}
 }
 
 func parseHammer(vals []string, servers map[string]string) {
@@ -68,27 +114,8 @@ func parseHammer(vals []string, servers map[string]string) {
 	}
 }
 
-func parseNetstat(server string, ports []string, outfile string) {
-
-	var file *os.File
-	var writer *csv.Writer
-	// Append if file exists
-	if _, err := os.Stat(outfile); os.IsNotExist(err) {
-		file, err = os.Create(outfile)
-		if err != nil {
-			log.Println("Error opening" + outfile)
-			return
-		}
-		writer = csv.NewWriter(file)
-		writer.Write([]string{"Short Name", "Process", "Port", "Protocol"})
-
-	} else {
-		file, err = os.Open(outfile)
-		writer = csv.NewWriter(file)
-	}
-	defer file.Close()
-	defer writer.Flush()
-
+func parseNetstat(server string, ipaddr string, ports []string, outfile string) {
+	set := make(map[string]bool)
 	for _, line := range ports {
 		short_name := strings.Replace(strings.Split(server, ".")[0], "nightly", "", -1)
 
@@ -104,13 +131,57 @@ func parseNetstat(server string, ports []string, outfile string) {
 				} else {
 					proc = "Unknown"
 				}
-				writer.Write([]string{short_name, proc, port, proto})
+				data := make([]string, 8)
+				ch := make(chan string)
+				data[0], data[1], data[2], data[3], data[4], data[5], data[6] = "", short_name, "", proc, short_name, port, proto
+				newkey := short_name + proc + port + proto
+				if _, ok := set[newkey]; !ok {
+					set[newkey] = true
+					go testPort(ipaddr, port, proto, ch)
+					data[7] = <-ch
+					err := writeCSV(data, outfile)
+					if err != nil {
+						log.Println(err)
+					}
+				}
 			}
 		}
 	}
 }
 
-func sshCommand(username string, password string, host string, port string, cmd string) []string {
+func testPort(host string, port string, proto string, ch chan string) {
+	conn, err := net.Dial(proto, host+":"+port)
+	if err != nil {
+		ch <- "Closed"
+	}
+	ch <- "Open"
+	conn.Close()
+}
+
+func writeCSV(val []string, outfile string) error {
+	var file *os.File
+	var writer *csv.Writer
+	if _, err := os.Stat(outfile); os.IsNotExist(err) {
+		file, err = os.Create(outfile)
+		if err != nil {
+			log.Println("Error opening" + outfile)
+			return err
+		}
+		writer = csv.NewWriter(file)
+		writer.Write([]string{"Provider Team", "Provider Application", "User Product Team", "User Application", "Device/Service", "Port", "Protocol", "FW_Open"})
+
+	} else {
+		file, err = os.OpenFile(outfile, os.O_APPEND|os.O_WRONLY, 0666)
+		writer = csv.NewWriter(file)
+	}
+	defer file.Close()
+	writer.Write(val)
+	writer.Flush()
+
+	return nil
+}
+
+func sshCommand(username string, password string, host string, port string, cmd string, ch chan []string) {
 	sshConfig := &ssh.ClientConfig{
 		User: username,
 		Auth: []ssh.AuthMethod{
@@ -121,23 +192,28 @@ func sshCommand(username string, password string, host string, port string, cmd 
 
 	conn, err := ssh.Dial("tcp", host+":"+port, sshConfig)
 	if err != nil {
-		log.Panic(err)
+		fmt.Println(err)
+		ch <- []string{""}
+		return
 	}
 	defer conn.Close()
 
 	session, err := conn.NewSession()
-	if err != nil {
-		log.Panicf("Error establishing session: %s", err)
-	}
 	defer session.Close()
+	if err != nil {
+		fmt.Println(err)
+		ch <- []string{""}
+		return
+	}
 
 	var b bytes.Buffer
 	session.Stdout = &b
 
 	if err := session.Run(cmd); err != nil {
-		log.Fatal("Failed to run:" + err.Error())
+		fmt.Println(err)
+		ch <- []string{""}
+		return
 	}
 
-	output := strings.Split(b.String(), "\n")
-	return output
+	ch <- strings.Split(b.String(), "\n")
 }
