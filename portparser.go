@@ -5,7 +5,7 @@ import (
 	"encoding/csv"
 	"flag"
 	"fmt"
-	"golang.org/x/crypto/ssh"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -13,20 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
-)
 
-func printHelp() {
-	fmt.Println("-sat", "Satellite Server to gather hammer host data from")
-	fmt.Println("-command", "Command to be run on remote servers")
-	fmt.Println("-port", "SSH Port")
-	fmt.Println("-username", "Username to use for SSH connections")
-	fmt.Println("-password", "Password for SSH connections")
-	fmt.Println("-outfile", "Output file for CSV data")
-	fmt.Println("-silent", "Prevent all extraneous output (for piping/automation)")
-	fmt.Println("-quiet", "Pipe informational messages to Stderr")
-	fmt.Println("-timeit", "Time each process")
-	fmt.Println("-help", "Help Text")
-}
+	"golang.org/x/crypto/ssh"
+)
 
 func main() {
 	const hammerCmd = "hammer host list"
@@ -43,13 +32,7 @@ func main() {
 	silentFlag := flag.Bool("silent", false, "Prevent all extraneous output (for piping/automation)")
 	quietFlag := flag.Bool("quiet", false, "Pipe informational messages to Stderr")
 	timeIt := flag.Bool("timeit", false, "Time each process")
-	helpFlag := flag.Bool("help", false, "Help Text")
 	flag.Parse()
-
-	if *helpFlag {
-		printHelp()
-		return
-	}
 
 	if *quietFlag {
 		output = "quiet"
@@ -93,6 +76,7 @@ func main() {
 func logOutput(msg string, outputType string) {
 	if outputType == "silent" {
 		// dont print informational messages
+		fmt.Fprint(ioutil.Discard, msg)
 		return
 	} else if outputType == "quiet" {
 		// print to stderr
